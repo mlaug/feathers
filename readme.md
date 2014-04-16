@@ -29,6 +29,32 @@ app.use('/todos', {
 });
 ```
 
+The default REST handler is a middleware that formats the data retrieved by the service as JSON. REST handling will be set up automatically when calling `var app = feathers()`. If you would like to configure the REST provider yourself, call `var app = feathers({ rest: false });`.
+
+Then you can configure it manually and add your own `handler` middleware that, for example just renders plain text with the todo description (`res.data` contains the data returned by the service):
+
+```js
+var app = feathers({ rest: false });
+
+app.use(feathers.urlencoded()).use(feathers.json())
+  .configure(feathers.rest(function restFormatter(req, res) {
+    res.format({
+      'text/plain': function() {
+        res.end('The todo is: ' + res.data.description);
+      }
+    });
+  }))
+  .use('/todo', {
+    get: function (id, params, callback) {
+      callback(null, { description: 'You have to do ' + id });
+    }
+  });
+```
+
+__Note:__ When configuring REST this way, you *have* to add `app.use(feathers.urlencoded()).use(feathers.json())` to support request body parsing.
+
+If you want to add other middleware *before* the REST handler, simply call `app.use(middleware)` before configuring the handler.
+
 ### SocketIO
 
 To expose services via [SocketIO](http://socket.io/) call `app.configure(feathers.socketio())`. It is also possible pass a `function(io) {}` when initializing the provider where `io` is the main SocketIO object. Since Feathers is only using the SocketIO default configuration, this is a good spot to initialize the [recommended production settings](https://github.com/LearnBoost/Socket.IO/wiki/Configuring-Socket.IO#recommended-production-settings):
@@ -74,6 +100,24 @@ app.configure(feathers.socketio(function(io) {
 }));
 ```
 
+Similar than the REST middleware, the SocketIO handshakes `feathers` property will be extended
+for service parameters:
+
+```js
+app.configure(feathers.socketio(function(io) {
+  io.set('authorization', function (handshake, callback) {
+    handshake.feathers.user = { name: 'David' };
+  });
+}));
+
+app.use('todos', {
+  create: function(data, params, callback) {
+    // When called via SocketIO:
+    params.user // -> { name: 'David' }
+  }
+});
+```
+
 Once the server has been started with `app.listen()` the SocketIO object is available as `app.io`.
 
 ### Primus
@@ -115,6 +159,23 @@ In the Browser you can connect like this:
     });
   });
 </script>
+```
+
+Just like REST and SocketIO, the Primus request object can be extended with a `feathers` parameter during authorization which will extend the `params` for any service request:
+
+```js
+app.configure(feathers.primus({
+  transformer: 'sockjs'
+}, function(primus) {
+  // Set up Primus authorization here
+  primus.authorize(function (req, done) {
+    req.feathers = {
+      user: { name: 'David' }
+    }
+
+    done();
+  });
+}));
 ```
 
 ## API
@@ -221,6 +282,7 @@ var myService = {
   get: function(id, params, callback) {},
   create: function(data, params, callback) {},
   update: function(id, data, params, callback) {},
+  patch: function(id, data, params, callback) {},
   remove: function(id, params, callback) {},
   setup: function(app) {}
 }
@@ -299,6 +361,25 @@ __SocketIO__
 
 ```js
 socket.emit('todo::update', 2, {
+  description: 'I really have to do laundry'
+}, {}, function(error, data) {
+  // data -> { id: 2, description: "I really have to do laundry" }
+});
+```
+
+### patch
+
+`patch(id, data, params, callback)` patches the resource identified by `id` using `data`. The callback should be called with the updated resource data. Implement `patch` additionally to `update` if you want to separate between partial and full updates and support the `PATCH` HTTP method.
+
+__REST__
+
+    PATCH todo/2
+    { "description": "I really have to do laundry" }
+
+__SocketIO__
+
+```js
+socket.emit('todo::patch', 2, {
   description: 'I really have to do laundry'
 }, {}, function(error, data) {
   // data -> { id: 2, description: "I really have to do laundry" }
@@ -419,9 +500,9 @@ __SocketIO__
 </script>
 ```
 
-### updated
+### updated, patched
 
-The `updated` event will be published with the callback data when a service `update` calls back successfully.
+The `updated` and `patched` events will be published with the callback data when a service `update` or `patch` method calls back successfully.
 
 ```js
 app.use('/my/todos/', {
@@ -484,6 +565,74 @@ __SocketIO__
 </script>
 ```
 
+### Event filtering
+
+By default all service events will be dispatched to all connected clients.
+In many cases you probably want to be able to only dispatch events for certain clients.
+This can be done by implementing the `created`, `updated`, `patched` and `removed` methods as `function(data, params, callback) {}` with `params` being the parameters set when the client connected, in SocketIO when authorizing and setting `handshake.feathers` and Primus with `req.feathers`.
+
+```js
+var myService = {
+  created: function(data, params, callback) {},
+  updated: function(data, params, callback) {},
+  patched: function(data, params, callback) {},
+  removed: function(data, params, callback) {}
+}
+```
+
+The event dispatching service methods will be run for every connected client. Calling the callback with data (that you also may modify) will dispatch the according event. Callling back with a falsy value will prevent the event being dispatched to this client.
+
+The following example only dispatches the Todo `updated` event if the authorized user belongs to the same company:
+
+```js
+app.configure(feathers.socketio(function(io) {
+  io.set('authorization', function (handshake, callback) {
+    // Authorize using the /users service
+    app.lookup('users').find({
+      username: handshake.username,
+      password: handshake.password
+    }, function(error, user) {
+      if(!error || !user) {
+        return callback(error, false);
+      }
+
+      handshake.feathers = {
+        user: user
+      };
+
+      callback(null, true);
+    });
+  });
+}));
+
+app.use('todos', {
+  update: function(id, data, params, callback) {
+    // Update
+    callback(null, data);
+  },
+
+  updated: function(todo, params, callback) {
+    // params === handshake.feathers
+    if(todo.companyId === params.user.companyId) {
+      // Dispatch the todo data to this client
+      return callback(null, todo);
+    }
+
+    // Call back with a falsy value to prevent dispatching
+    callback(null, false);
+  }
+});
+```
+
+On the client:
+
+```js
+socket.on('todo updated', function(data) {
+  // The client will only get this event
+  // if authorized and in the same company
+});
+```
+
 ## Why?
 
 We know! Oh God another NodeJS framework! We really didn't want to add another name to the long list of NodeJS web frameworks but also wanted to explore a different approach than any other framework we have seen. We strongly believe that data is the core of the web and should be the focus of web applications.
@@ -493,6 +642,18 @@ We also think that your data resources can and should be encapsulated in such a 
 With that being said there are some amazing frameworks already out there and we wanted to leverage the ideas that have been put into them, which is why Feathers is built on top of [Express](http://expressjs.com) and is inspired in part by [Sails](http://sailsjs.org), [Flatiron](http://flatironjs.org) and [Derby](http://derbyjs.com).
 
 ## Changelog
+
+__0.4.0__
+
+- Allow socket provider event filtering and params passthrough ([#49](https://github.com/feathersjs/feathers/pull/49), [#50](https://github.com/feathersjs/feathers/pull/50), [#51](https://github.com/feathersjs/feathers/pull/51))
+- Added `patch` support ([#47](https://github.com/feathersjs/feathers/pull/47))
+- Allow to configure REST handler manually ([#40](https://github.com/feathersjs/feathers/issues/40), [#52](https://github.com/feathersjs/feathers/pull/52))
+
+
+__0.3.2__
+
+- Allows Feathers to use other Express apps ([#46](https://github.com/feathersjs/feathers/pull/46))
+- Updated dependencies and switched to Lodash ([#42](https://github.com/feathersjs/feathers/pull/42))
 
 __0.3.1__
 
